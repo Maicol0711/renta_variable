@@ -1,0 +1,264 @@
+---
+title: "Renta Variable — Parte 1"
+subtitle: "Datos, retornos y preparación para la optimización"
+author: "Universidad El Bosque"
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 2
+    code-fold: false
+    code-copy: true
+    code-overflow: wrap
+execute:
+  warning: false
+  message: false
+---
+
+# 1. Idea de la sesión
+
+En esta primera parte construiremos la base empírica que utilizará el optimizador:
+
+\[
+\text{precios}
+\longrightarrow
+\text{retornos semanales}
+\longrightarrow
+\widehat{\mu},\widehat{\Sigma}
+\longrightarrow
+\text{muestra de estimación}.
+\]
+
+Trabajaremos con cinco acciones:
+
+\[
+\text{IBM},\quad \text{WMT},\quad \text{XOM},\quad \text{PFE},\quad \text{DIS}.
+\]
+
+::: {.callout-note}
+## Regla metodológica
+Los pesos se estimarán con información de **2021–2023**. El periodo **2024–2025** se reservará para evaluar el desempeño fuera de muestra.
+:::
+
+# 2. Paquetes
+
+```{r}
+library(tidyverse)                  # Manipulación, tablas y gráficos
+library(tidyquant)                  # Datos financieros y retornos
+library(PerformanceAnalytics)       # Medidas de riesgo y desempeño
+library(xts)                        # Formato requerido por varios paquetes financieros
+```
+
+# 3. Descarga de precios
+
+Usamos fechas fijas para que el ejercicio sea reproducible.
+
+```{r}
+tickers <- c("IBM","WMT","XOM","PFE","DIS")       # Activos del ejercicio
+fecha_inicio <- as.Date("2021-01-01")             # Inicio de la muestra
+fecha_fin <- as.Date("2026-01-01")                # Límite superior
+precios <- tq_get(
+  tickers,
+  get = "stock.prices",
+  from = fecha_inicio,
+  to = fecha_fin
+)
+```
+
+Revisamos cuántas observaciones se descargaron para cada activo.
+
+```{r}
+precios |>
+  count(symbol,name="observaciones")
+```
+
+También inspeccionamos las primeras filas.
+
+```{r}
+precios |>
+  select(symbol,date,adjusted) |>
+  group_by(symbol) |>
+  slice_head(n=3)
+```
+
+::: {.callout-tip}
+## Para discutir
+¿Por qué conviene usar fechas fijas y no `Sys.Date()` cuando queremos que otro estudiante pueda reproducir exactamente el análisis?
+:::
+
+# 4. Evolución de precios
+
+Para comparar activos con niveles de precio diferentes, normalizamos todos a 100 en su primera observación.
+
+```{r}
+precios_indice <- precios |>
+  select(symbol,date,adjusted) |>
+  group_by(symbol) |>
+  arrange(date,.by_group=TRUE) |>
+  mutate(indice_100=100*adjusted/first(adjusted)) |>
+  ungroup()
+```
+
+```{r}
+precios_indice |>
+  ggplot(aes(date,indice_100,color=symbol))+
+  geom_line(linewidth=.7)+
+  labs(
+    title="Evolución relativa de los precios",
+    subtitle="Base 100 en la primera observación",
+    x=NULL,y="Índice base 100",color=NULL
+  )+
+  theme_minimal(base_size=12)+
+  theme(legend.position="bottom")
+```
+
+# 5. Retornos semanales
+
+Trabajaremos con retornos simples semanales.
+
+```{r}
+retornos_sem <- precios |>
+  group_by(symbol) |>
+  tq_transmute(
+    select=adjusted,
+    mutate_fun=periodReturn,
+    period="weekly",
+    type="arithmetic",
+    col_rename="retorno"
+  ) |>
+  ungroup()
+```
+
+```{r}
+retornos_sem |>
+  group_by(symbol) |>
+  summarise(
+    n=n(),
+    media=mean(retorno,na.rm=TRUE),
+    volatilidad=sd(retorno,na.rm=TRUE),
+    .groups="drop"
+  )
+```
+
+# 6. Formato ancho
+
+Para trabajar con matrices de covarianza y con `PortfolioAnalytics`, necesitamos una columna por activo.
+
+```{r}
+retornos_wide <- retornos_sem |>
+  select(date,symbol,retorno) |>
+  pivot_wider(names_from=symbol,values_from=retorno) |>
+  arrange(date) |>
+  drop_na()
+```
+
+```{r}
+retornos_wide |>
+  slice_head(n=6)
+```
+
+# 7. Muestra de estimación y muestra de evaluación
+
+```{r}
+retornos_train <- retornos_wide |>
+  filter(date >= as.Date("2021-01-01"),date <= as.Date("2023-12-31"))
+retornos_test <- retornos_wide |>
+  filter(date >= as.Date("2024-01-01"),date <= as.Date("2025-12-31"))
+```
+
+```{r}
+tibble(
+  muestra=c("Estimación 2021–2023","Evaluación 2024–2025"),
+  observaciones=c(nrow(retornos_train),nrow(retornos_test))
+)
+```
+
+# 8. Resumen estadístico tidy
+
+```{r}
+resumen_train <- retornos_train |>
+  pivot_longer(-date,names_to="activo",values_to="retorno") |>
+  group_by(activo) |>
+  summarise(
+    retorno_semanal=mean(retorno),
+    volatilidad_semanal=sd(retorno),
+    retorno_anual_aprox=52*retorno_semanal,
+    volatilidad_anual=sqrt(52)*volatilidad_semanal,
+    .groups="drop"
+  )
+resumen_train
+```
+
+```{r}
+resumen_train |>
+  ggplot(aes(volatilidad_anual,retorno_anual_aprox,label=activo))+
+  geom_point(size=3)+
+  geom_text(nudge_y=.01)+
+  scale_x_continuous(labels=scales::percent)+
+  scale_y_continuous(labels=scales::percent)+
+  labs(
+    title="Riesgo y retorno estimados",
+    subtitle="Muestra 2021–2023",
+    x="Volatilidad anualizada",
+    y="Retorno anual aproximado"
+  )+
+  theme_minimal(base_size=12)
+```
+
+# 9. Matriz de correlaciones
+
+Aquí utilizamos `cor()` porque la correlación es una operación matricial básica.
+
+```{r}
+correlaciones <- retornos_train |>
+  select(all_of(tickers)) |>
+  cor(use="complete.obs") |>
+  as.data.frame() |>
+  rownames_to_column("activo_1") |>
+  as_tibble() |>
+  pivot_longer(-activo_1,names_to="activo_2",values_to="correlacion")
+```
+
+```{r}
+correlaciones |>
+  ggplot(aes(activo_1,activo_2,fill=correlacion))+
+  geom_tile()+
+  geom_text(aes(label=round(correlacion,2)))+
+  scale_fill_gradient2(limits=c(-1,1))+
+  labs(title="Matriz de correlaciones",x=NULL,y=NULL,fill="Correlación")+
+  theme_minimal(base_size=12)
+```
+
+# 10. Conversión a `xts`
+
+La manipulación principal se hizo con `tidyverse`. Convertimos a `xts` únicamente porque `PerformanceAnalytics` y `PortfolioAnalytics` trabajan naturalmente con este tipo de objeto.
+
+```{r}
+R_train <- xts(
+  retornos_train |> select(all_of(tickers)),
+  order.by=retornos_train$date
+)
+R_test <- xts(
+  retornos_test |> select(all_of(tickers)),
+  order.by=retornos_test$date
+)
+```
+
+```{r}
+table.AnnualizedReturns(R_train,scale=52)
+```
+
+::: {.callout-important}
+## Resultado de esta parte
+Ya tenemos la información necesaria para optimizar:
+
+\[
+R_{\text{train}},
+\qquad
+\widehat{\mu},
+\qquad
+\widehat{\Sigma}.
+\]
+
+La siguiente parte utilizará esta muestra para construir portafolios con restricciones diferentes.
+:::

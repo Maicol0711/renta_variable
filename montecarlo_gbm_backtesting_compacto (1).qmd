@@ -1,0 +1,246 @@
+---
+title: "Derivados y simulación Monte Carlo de precios"
+subtitle: "Renta Variable — Universidad El Bosque"
+format:
+  html:
+    toc: true
+    code-fold: false
+execute:
+  warning: false
+  message: false
+---
+
+## 1. Derivados financieros
+
+Un **derivado** es un contrato cuyo valor depende de un activo subyacente.
+
+| Instrumento | Idea principal |
+|---|---|
+| Forward | Acuerdo privado para comprar o vender en una fecha futura a un precio pactado hoy |
+| Futuro | Forward estandarizado y negociado en mercado organizado |
+| Opción | Derecho, pero no obligación, de comprar o vender bajo condiciones pactadas |
+
+Video breve:
+
+https://www.youtube.com/watch?v=5uTeOEBIcpw
+
+> **Pregunta:** ¿qué diferencia fundamental existe entre un forward/futuro y una opción?
+
+## 2. Modelo del precio
+
+Supondremos que el precio sigue un movimiento browniano geométrico:
+
+\[
+dS_t=\mu S_t\,dt+\sigma S_t\,dW_t.
+\]
+
+Entonces
+
+\[
+S_T=S_0\exp\left[\left(\mu-\frac{\sigma^2}{2}\right)T+\sigma\sqrt{T}Z\right],
+\qquad Z\sim N(0,1).
+\]
+
+Usaremos una acción real para estimar \(\mu\) y \(\sigma\) y simular precios futuros.
+
+## 3. Datos reales
+
+```{r}
+library(tidyverse)
+library(tidyquant)
+library(lubridate)
+ticker <- "AAPL"
+fecha_inicio <- as.Date("2022-01-01")
+fecha_corte <- as.Date("2025-12-31")
+fecha_fin <- as.Date("2026-03-31")
+dias_anio <- 252
+horizonte <- 21
+n_sim <- 10000
+set.seed(2026)
+```
+
+```{r}
+precios <- tq_get(
+  ticker,
+  get = "stock.prices",
+  from = fecha_inicio,
+  to = fecha_fin
+) |>
+  select(date, adjusted) |>
+  arrange(date) |>
+  mutate(log_return = log(adjusted / lag(adjusted)))
+```
+
+```{r}
+precios |>
+  ggplot(aes(date, adjusted)) +
+  geom_line(linewidth = 0.7) +
+  labs(title = paste("Precio ajustado de", ticker), x = NULL, y = "USD") +
+  theme_minimal()
+```
+
+## 4. Estimación de parámetros
+
+Usamos únicamente los datos anteriores a la fecha de corte.
+
+\[
+\widehat{\sigma}=s_r\sqrt{252},
+\qquad
+\widehat{\mu}=252\bar r+\frac{\widehat{\sigma}^2}{2}.
+\]
+
+```{r}
+train <- precios |>
+  filter(date <= fecha_corte, !is.na(log_return))
+parametros <- train |>
+  summarise(
+    media_diaria = mean(log_return),
+    sd_diaria = sd(log_return),
+    sigma_hat = sd_diaria * sqrt(dias_anio),
+    mu_hat = dias_anio * media_diaria + sigma_hat^2 / 2
+  )
+parametros
+```
+
+```{r}
+mu_hat <- parametros$mu_hat
+sigma_hat <- parametros$sigma_hat
+S0 <- precios |>
+  filter(date <= fecha_corte) |>
+  slice_tail(n = 1) |>
+  pull(adjusted)
+S0
+```
+
+## 5. Monte Carlo a 21 días
+
+Para
+
+\[
+T=\frac{21}{252},
+\]
+
+simulamos
+
+\[
+S_T=S_0\exp\left[\left(\widehat\mu-\frac{\widehat\sigma^2}{2}\right)T+\widehat\sigma\sqrt{T}Z\right].
+\]
+
+```{r}
+T <- horizonte / dias_anio
+simulaciones <- tibble(
+  simulacion = 1:n_sim,
+  z = rnorm(n_sim)
+) |>
+  mutate(
+    S_T = S0 * exp(
+      (mu_hat - sigma_hat^2 / 2) * T +
+      sigma_hat * sqrt(T) * z
+    )
+  )
+```
+
+```{r}
+resumen <- simulaciones |>
+  summarise(
+    media = mean(S_T),
+    mediana = median(S_T),
+    li_95 = quantile(S_T, 0.025),
+    ls_95 = quantile(S_T, 0.975)
+  )
+resumen
+```
+
+```{r}
+simulaciones |>
+  ggplot(aes(S_T)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 45) +
+  geom_density(linewidth = 0.8) +
+  labs(
+    title = paste("Distribución simulada de", ticker, "a 21 días"),
+    x = "Precio futuro",
+    y = "Densidad"
+  ) +
+  theme_minimal()
+```
+
+## 6. Validación fuera de muestra
+
+Comparamos la distribución simulada con el precio realmente observado aproximadamente 21 sesiones después.
+
+```{r}
+i0 <- max(which(precios$date <= fecha_corte))
+precio_real <- precios |>
+  slice(i0 + horizonte) |>
+  transmute(
+    fecha = date,
+    precio_real = adjusted
+  )
+precio_real
+```
+
+```{r}
+comparacion <- resumen |>
+  mutate(
+    precio_real = precio_real$precio_real,
+    cubierto_95 = precio_real >= li_95 & precio_real <= ls_95
+  )
+comparacion
+```
+
+### Discusión
+
+1. ¿El precio real quedó dentro del intervalo predictivo del 95%?
+2. ¿Qué tan lejos estuvo de la mediana simulada?
+3. ¿Qué supuestos del modelo pueden explicar una mala predicción?
+
+## 7. Conexión con opciones
+
+Una call europea con strike \(K\) paga
+
+\[
+C_T=(S_T-K)^+.
+\]
+
+```{r}
+K <- S0 * 1.05
+payoffs <- simulaciones |>
+  mutate(
+    payoff_call = pmax(S_T - K, 0)
+  )
+payoffs |>
+  summarise(
+    prob_ITM = mean(S_T > K),
+    payoff_medio = mean(payoff_call)
+  )
+```
+
+> **Importante:** este payoff medio usa \(\widehat{\mu}\) histórico. **No es todavía el precio de la opción.**
+
+En la valoración de derivados pasaremos posteriormente a una medida neutral al riesgo.
+
+## 8. Para repetir en clase
+
+Cambie únicamente el ticker:
+
+```{r}
+ticker <- "NVDA"
+```
+
+o
+
+```{r}
+ticker <- "TSLA"
+```
+
+y compare:
+
+\[
+\widehat{\mu},
+\qquad
+\widehat{\sigma},
+\qquad
+[LI_{95},LS_{95}],
+\qquad
+P(S_T>K).
+\]

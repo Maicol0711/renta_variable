@@ -1,0 +1,363 @@
+---
+title: "Renta Variable — Parte 2"
+subtitle: "Optimización de portafolios con PortfolioAnalytics"
+author: "Universidad El Bosque"
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 2
+    code-fold: false
+    code-copy: true
+    code-overflow: wrap
+execute:
+  warning: false
+  message: false
+---
+
+# 1. Problema de optimización
+
+Compararemos dos políticas de inversión construidas con la misma muestra 2021–2023.
+
+**Portafolio A**
+
+\[
+\min_w w^\top\widehat{\Sigma}w
+\]
+
+sujeto a
+
+\[
+\mathbf 1^\top w=1.
+\]
+
+**Portafolio B**
+
+\[
+\min_w w^\top\widehat{\Sigma}w
+\]
+
+sujeto a
+
+\[
+\mathbf1^\top w=1,
+\qquad
+0\leq w_i\leq0.30,
+\qquad
+\widehat{\mu}^{\top}w\geq\mu_{\min}.
+\]
+
+# 2. Paquetes y datos
+
+```{r}
+library(tidyverse)
+library(tidyquant)
+library(PortfolioAnalytics)
+library(PerformanceAnalytics)
+library(ROI)
+library(ROI.plugin.quadprog)
+library(ROI.plugin.glpk)
+library(xts)
+```
+
+Para que este archivo sea autocontenido, reconstruimos rápidamente la muestra de estimación.
+
+```{r}
+tickers <- c("IBM","WMT","XOM","PFE","DIS")
+R_train_tbl <- tq_get(
+  tickers,
+  get="stock.prices",
+  from="2021-01-01",
+  to="2024-01-01"
+) |>
+  group_by(symbol) |>
+  tq_transmute(
+    select=adjusted,
+    mutate_fun=periodReturn,
+    period="weekly",
+    type="arithmetic",
+    col_rename="retorno"
+  ) |>
+  ungroup() |>
+  pivot_wider(names_from=symbol,values_from=retorno) |>
+  arrange(date) |>
+  drop_na()
+R_train <- xts(
+  R_train_tbl |> select(all_of(tickers)),
+  order.by=R_train_tbl$date
+)
+```
+
+# 3. Portafolio A: GMV flexible
+
+```{r}
+spec_A <- portfolio.spec(assets=tickers) |>
+  add.constraint(type="full_investment") |>
+  add.objective(type="risk",name="var")
+```
+
+```{r}
+opt_A <- optimize.portfolio(
+  R=R_train,
+  portfolio=spec_A,
+  optimize_method="ROI",
+  trace=TRUE
+)
+```
+
+Extraemos los pesos en formato tidy.
+
+```{r}
+pesos_A <- extractWeights(opt_A) |>
+  enframe(name="activo",value="peso") |>
+  mutate(portafolio="A: GMV flexible")
+pesos_A
+```
+
+```{r}
+pesos_A |>
+  ggplot(aes(activo,peso,fill=peso<0))+
+  geom_col()+
+  scale_y_continuous(labels=scales::percent)+
+  labs(
+    title="Pesos del portafolio A",
+    subtitle="Los pesos negativos representan posiciones cortas",
+    x=NULL,y="Peso",fill="Peso negativo"
+  )+
+  theme_minimal(base_size=12)
+```
+
+::: {.callout-tip}
+## Para discutir
+Si aparece un peso negativo, ¿significa que el optimizador se equivocó?
+:::
+
+# 4. Portafolio B: conjunto factible restringido
+
+Imponemos:
+
+\[
+0\leq w_i\leq0.30.
+\]
+
+```{r}
+spec_B_base <- portfolio.spec(assets=tickers) |>
+  add.constraint(type="full_investment") |>
+  add.constraint(type="box",min=0,max=0.30)
+```
+
+# 5. GMV restringido
+
+```{r}
+spec_B_gmv <- spec_B_base |>
+  add.objective(type="risk",name="var")
+opt_B_gmv <- optimize.portfolio(
+  R=R_train,
+  portfolio=spec_B_gmv,
+  optimize_method="ROI"
+)
+```
+
+```{r}
+pesos_B_gmv <- extractWeights(opt_B_gmv) |>
+  enframe(name="activo",value="peso")
+pesos_B_gmv
+```
+
+# 6. Máximo retorno factible
+
+Antes de imponer un target, averiguamos cuál es el máximo retorno medio compatible con las restricciones.
+
+```{r}
+spec_B_max <- spec_B_base |>
+  add.objective(type="return",name="mean")
+opt_B_max <- optimize.portfolio(
+  R=R_train,
+  portfolio=spec_B_max,
+  optimize_method="ROI"
+)
+```
+
+```{r}
+w_B_gmv <- extractWeights(opt_B_gmv)
+w_B_max <- extractWeights(opt_B_max)
+mu_sem <- colMeans(R_train)
+mu_B_gmv <- sum(w_B_gmv*mu_sem)
+mu_B_max <- sum(w_B_max*mu_sem)
+tibble(
+  referencia=c("GMV restringido","Máximo retorno factible"),
+  retorno_semanal=c(mu_B_gmv,mu_B_max),
+  retorno_anual_aprox=52*c(mu_B_gmv,mu_B_max)
+)
+```
+
+# 7. Definición del target
+
+Escogemos un target al 60% del recorrido entre ambos extremos:
+
+\[
+\mu_{\min}
+=
+\mu_{GMV,R}
++
+0.60(\mu_{\max,R}-\mu_{GMV,R}).
+\]
+
+```{r}
+target_sem <- mu_B_gmv+0.60*(mu_B_max-mu_B_gmv)
+tibble(
+  target_semanal=target_sem,
+  target_anual_aprox=52*target_sem
+)
+```
+
+::: {.callout-note}
+## Interpretación
+El target no se eligió arbitrariamente. Está construido dentro del conjunto factible y por encima del retorno del GMV restringido.
+:::
+
+# 8. Portafolio B con retorno mínimo
+
+```{r}
+spec_B <- spec_B_base |>
+  add.constraint(type="return",return_target=target_sem) |>
+  add.objective(type="risk",name="var")
+opt_B <- optimize.portfolio(
+  R=R_train,
+  portfolio=spec_B,
+  optimize_method="ROI",
+  trace=TRUE
+)
+```
+
+```{r}
+pesos_B <- extractWeights(opt_B) |>
+  enframe(name="activo",value="peso") |>
+  mutate(portafolio="B: restringido")
+pesos_B
+```
+
+# 9. Verificación de restricciones
+
+```{r}
+w_B <- extractWeights(opt_B)
+verificacion_B <- tibble(
+  condicion=c("Suma de pesos","Peso mínimo","Peso máximo","Retorno semanal","Holgura del target"),
+  valor=c(
+    sum(w_B),
+    min(w_B),
+    max(w_B),
+    sum(w_B*mu_sem),
+    sum(w_B*mu_sem)-target_sem
+  )
+)
+verificacion_B
+```
+
+Si la holgura es aproximadamente cero, la restricción de retorno está activa.
+
+# 10. Comparación de pesos
+
+```{r}
+pesos_comparacion <- bind_rows(
+  pesos_A,
+  pesos_B
+)
+```
+
+```{r}
+pesos_comparacion |>
+  ggplot(aes(activo,peso,fill=portafolio))+
+  geom_col(position="dodge")+
+  scale_y_continuous(labels=scales::percent)+
+  labs(
+    title="Comparación de políticas de inversión",
+    x=NULL,y="Peso",fill=NULL
+  )+
+  theme_minimal(base_size=12)+
+  theme(legend.position="bottom")
+```
+
+# 11. Comparación ex ante
+
+```{r}
+Sigma_sem <- cov(R_train)
+w_A <- extractWeights(opt_A)
+metricas_exante <- tibble(
+  portafolio=c("A: GMV flexible","B: restringido"),
+  retorno_anual_aprox=52*c(
+    sum(w_A*mu_sem),
+    sum(w_B*mu_sem)
+  ),
+  volatilidad_anual=sqrt(52)*c(
+    sqrt(as.numeric(t(w_A)%*%Sigma_sem%*%w_A)),
+    sqrt(as.numeric(t(w_B)%*%Sigma_sem%*%w_B))
+  ),
+  peso_minimo=c(min(w_A),min(w_B)),
+  peso_maximo=c(max(w_A),max(w_B)),
+  posiciones_cortas=c(sum(w_A<0),sum(w_B<0))
+)
+metricas_exante
+```
+
+::: {.callout-important}
+## Pregunta central
+El portafolio A dispone de un conjunto factible más amplio. Por tanto, debería obtener una varianza estimada no mayor que B.
+
+¿Esa ventaja también aparecerá cuando ambos portafolios se evalúen con datos posteriores?
+:::
+
+# 12. Fronteras eficientes
+
+Construimos una frontera para cada conjunto de restricciones.
+
+```{r}
+front_A_spec <- portfolio.spec(assets=tickers) |>
+  add.constraint(type="full_investment") |>
+  add.objective(type="return",name="mean") |>
+  add.objective(type="risk",name="var")
+front_B_spec <- portfolio.spec(assets=tickers) |>
+  add.constraint(type="full_investment") |>
+  add.constraint(type="box",min=0,max=0.30) |>
+  add.objective(type="return",name="mean") |>
+  add.objective(type="risk",name="var")
+front_A <- create.EfficientFrontier(
+  R=R_train,
+  portfolio=front_A_spec,
+  type="mean-StdDev",
+  optimize_method="ROI",
+  n.portfolios=30
+)
+front_B <- create.EfficientFrontier(
+  R=R_train,
+  portfolio=front_B_spec,
+  type="mean-StdDev",
+  optimize_method="ROI",
+  n.portfolios=30
+)
+```
+
+```{r}
+chart.EfficientFrontier(
+  front_A,
+  match.col="StdDev",
+  chart.assets=TRUE,
+  labels.assets=TRUE,
+  main="Frontera eficiente: conjunto flexible"
+)
+```
+
+```{r}
+chart.EfficientFrontier(
+  front_B,
+  match.col="StdDev",
+  chart.assets=TRUE,
+  labels.assets=TRUE,
+  main="Frontera eficiente: conjunto restringido"
+)
+```
+
+::: {.callout-tip}
+## Para cerrar esta parte
+Las restricciones no cambian la definición de riesgo de Markowitz. Cambian el **conjunto de portafolios entre los cuales podemos elegir**.
+:::

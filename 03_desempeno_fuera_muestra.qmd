@@ -1,0 +1,304 @@
+---
+title: "Renta Variable — Parte 3"
+subtitle: "Evaluación fuera de muestra y comparación de desempeño"
+author: "Universidad El Bosque"
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 2
+    code-fold: false
+    code-copy: true
+    code-overflow: wrap
+execute:
+  warning: false
+  message: false
+---
+
+# 1. Idea de esta parte
+
+Los pesos se estiman con datos de 2021–2023, pero se evalúan con retornos que el optimizador no utilizó:
+
+\[
+\underbrace{2021\text{--}2023}_{\text{estimación}}
+\longrightarrow
+(w_A,w_B)
+\longrightarrow
+\underbrace{2024\text{--}2025}_{\text{evaluación}}.
+\]
+
+Esta separación permite distinguir:
+
+\[
+\text{óptimo dentro de muestra}
+\neq
+\text{mejor desempeño futuro}.
+\]
+
+# 2. Paquetes
+
+```{r}
+library(tidyverse)
+library(tidyquant)
+library(PortfolioAnalytics)
+library(PerformanceAnalytics)
+library(ROI)
+library(ROI.plugin.quadprog)
+library(ROI.plugin.glpk)
+library(xts)
+```
+
+# 3. Reconstrucción de datos
+
+```{r}
+tickers <- c("IBM","WMT","XOM","PFE","DIS")
+retornos <- tq_get(
+  tickers,
+  get="stock.prices",
+  from="2021-01-01",
+  to="2026-01-01"
+) |>
+  group_by(symbol) |>
+  tq_transmute(
+    select=adjusted,
+    mutate_fun=periodReturn,
+    period="weekly",
+    type="arithmetic",
+    col_rename="retorno"
+  ) |>
+  ungroup() |>
+  pivot_wider(names_from=symbol,values_from=retorno) |>
+  arrange(date) |>
+  drop_na()
+train_tbl <- retornos |>
+  filter(date <= as.Date("2023-12-31"))
+test_tbl <- retornos |>
+  filter(date >= as.Date("2024-01-01"))
+R_train <- xts(train_tbl |> select(all_of(tickers)),order.by=train_tbl$date)
+R_test <- xts(test_tbl |> select(all_of(tickers)),order.by=test_tbl$date)
+```
+
+# 4. Reestimación de los dos portafolios
+
+## Portafolio A
+
+```{r}
+spec_A <- portfolio.spec(assets=tickers) |>
+  add.constraint(type="full_investment") |>
+  add.objective(type="risk",name="var")
+opt_A <- optimize.portfolio(
+  R=R_train,
+  portfolio=spec_A,
+  optimize_method="ROI"
+)
+w_A <- extractWeights(opt_A)
+```
+
+## Portafolio B
+
+```{r}
+spec_B_base <- portfolio.spec(assets=tickers) |>
+  add.constraint(type="full_investment") |>
+  add.constraint(type="box",min=0,max=0.30)
+opt_B_gmv <- optimize.portfolio(
+  R=R_train,
+  portfolio=spec_B_base |> add.objective(type="risk",name="var"),
+  optimize_method="ROI"
+)
+opt_B_max <- optimize.portfolio(
+  R=R_train,
+  portfolio=spec_B_base |> add.objective(type="return",name="mean"),
+  optimize_method="ROI"
+)
+mu_sem <- colMeans(R_train)
+mu_B_gmv <- sum(extractWeights(opt_B_gmv)*mu_sem)
+mu_B_max <- sum(extractWeights(opt_B_max)*mu_sem)
+target_sem <- mu_B_gmv+0.60*(mu_B_max-mu_B_gmv)
+spec_B <- spec_B_base |>
+  add.constraint(type="return",return_target=target_sem) |>
+  add.objective(type="risk",name="var")
+opt_B <- optimize.portfolio(
+  R=R_train,
+  portfolio=spec_B,
+  optimize_method="ROI"
+)
+w_B <- extractWeights(opt_B)
+```
+
+# 5. Pesos que llevamos al periodo de prueba
+
+```{r}
+bind_rows(
+  enframe(w_A,name="activo",value="peso") |> mutate(portafolio="A: GMV flexible"),
+  enframe(w_B,name="activo",value="peso") |> mutate(portafolio="B: restringido")
+) |>
+  ggplot(aes(activo,peso,fill=portafolio))+
+  geom_col(position="dodge")+
+  scale_y_continuous(labels=scales::percent)+
+  labs(title="Pesos estimados con 2021–2023",x=NULL,y="Peso",fill=NULL)+
+  theme_minimal(base_size=12)+
+  theme(legend.position="bottom")
+```
+
+# 6. Retornos fuera de muestra
+
+Congelamos la política y usamos rebalanceo mensual.
+
+```{r}
+R_A_oos <- Return.portfolio(
+  R_test,
+  weights=w_A[colnames(R_test)],
+  rebalance_on="months"
+)
+R_B_oos <- Return.portfolio(
+  R_test,
+  weights=w_B[colnames(R_test)],
+  rebalance_on="months"
+)
+colnames(R_A_oos) <- "A_GMV_flexible"
+colnames(R_B_oos) <- "B_restringido"
+R_oos <- merge(R_A_oos,R_B_oos)
+```
+
+# 7. Retorno y volatilidad observados
+
+```{r}
+table.AnnualizedReturns(R_oos,scale=52)
+```
+
+::: {.callout-tip}
+## Para discutir
+¿El portafolio con menor volatilidad estimada en 2021–2023 conserva esa ventaja durante 2024–2025?
+:::
+
+# 8. Trayectoria de riqueza
+
+Convertimos los retornos del portafolio a tibble para graficar con `ggplot2`.
+
+```{r}
+riqueza_tbl <- R_oos |>
+  fortify.zoo() |>
+  as_tibble() |>
+  rename(date=Index) |>
+  pivot_longer(-date,names_to="portafolio",values_to="retorno") |>
+  group_by(portafolio) |>
+  arrange(date,.by_group=TRUE) |>
+  mutate(riqueza=cumprod(1+retorno)) |>
+  ungroup()
+```
+
+```{r}
+riqueza_tbl |>
+  ggplot(aes(date,riqueza,color=portafolio))+
+  geom_line(linewidth=.9)+
+  labs(
+    title="Desempeño acumulado fuera de muestra",
+    subtitle="Periodo 2024–2025",
+    x=NULL,y="Valor de $1 invertido",color=NULL
+  )+
+  theme_minimal(base_size=12)+
+  theme(legend.position="bottom")
+```
+
+# 9. Métricas de desempeño
+
+Usamos `purrr` para evitar repetir el mismo código para cada portafolio.
+
+```{r}
+columnas <- colnames(R_oos)
+metricas_oos <- map_dfr(columnas,\(nombre){
+  x <- R_oos[,nombre,drop=FALSE]
+  tibble(
+    portafolio=nombre,
+    retorno_anual=as.numeric(Return.annualized(x,scale=52)),
+    volatilidad_anual=as.numeric(StdDev.annualized(x,scale=52)),
+    Sharpe=as.numeric(SharpeRatio.annualized(x,Rf=0,scale=52)),
+    Sortino=as.numeric(SortinoRatio(x,MAR=0)),
+    max_drawdown=as.numeric(maxDrawdown(x)),
+    VaR_95=as.numeric(VaR(x,p=.95,method="historical",invert=FALSE)),
+    ES_95=as.numeric(ES(x,p=.95,method="historical",invert=FALSE))
+  )
+})
+metricas_oos
+```
+
+# 10. Comparación gráfica de métricas
+
+```{r}
+metricas_oos |>
+  select(portafolio,retorno_anual,volatilidad_anual,Sharpe,Sortino,max_drawdown) |>
+  pivot_longer(-portafolio,names_to="metrica",values_to="valor") |>
+  ggplot(aes(portafolio,valor,fill=portafolio))+
+  geom_col(show.legend=FALSE)+
+  facet_wrap(~metrica,scales="free_y")+
+  labs(title="Comparación fuera de muestra",x=NULL,y=NULL)+
+  theme_minimal(base_size=11)+
+  theme(axis.text.x=element_text(angle=15,hjust=1))
+```
+
+# 11. Ex ante frente a ex post
+
+Calculamos primero las métricas estimadas de riesgo y retorno.
+
+```{r}
+Sigma_sem <- cov(R_train)
+exante <- tibble(
+  portafolio=c("A_GMV_flexible","B_restringido"),
+  retorno_estimado=52*c(sum(w_A*mu_sem),sum(w_B*mu_sem)),
+  volatilidad_estimada=sqrt(52)*c(
+    sqrt(as.numeric(t(w_A)%*%Sigma_sem%*%w_A)),
+    sqrt(as.numeric(t(w_B)%*%Sigma_sem%*%w_B))
+  )
+)
+```
+
+Unimos estimación y desempeño observado.
+
+```{r}
+comparacion_final <- exante |>
+  left_join(
+    metricas_oos |>
+      select(portafolio,retorno_anual,volatilidad_anual,Sharpe,Sortino,max_drawdown),
+    by="portafolio"
+  )
+comparacion_final
+```
+
+# 12. Interpretación final
+
+::: {.callout-important}
+## Preguntas de cierre
+
+1. ¿Cuál portafolio tenía menor riesgo estimado?
+2. ¿Cuál presentó menor volatilidad fuera de muestra?
+3. ¿Cuál produjo mayor retorno observado?
+4. ¿Cuál tuvo mejor Sharpe?
+5. ¿Cuál tuvo mejor Sortino?
+6. ¿Cuál presentó menor drawdown?
+7. ¿Las restricciones mejoraron o empeoraron el desempeño observado?
+8. ¿Qué evidencia ofrece el ejercicio sobre el riesgo de estimación?
+:::
+
+La idea fundamental es:
+
+\[
+w^*=w^*(\widehat{\mu},\widehat{\Sigma}).
+\]
+
+El optimizador trabaja con estimaciones obtenidas de una muestra histórica. Por ello, una solución óptima dentro de muestra no garantiza el mejor desempeño fuera de muestra.
+
+# 13. Cierre
+
+En estas tres partes utilizamos:
+
+\[
+\boxed{
+\texttt{tidyquant}
+\rightarrow
+\texttt{PortfolioAnalytics}
+\rightarrow
+\texttt{PerformanceAnalytics}
+}
+\]
+
+para conectar datos reales, optimización matemática y evaluación empírica.
